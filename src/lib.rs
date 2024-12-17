@@ -19,27 +19,66 @@ fn analyze_trend(context_window: PyReadonlyArray1<f32>, prediction_window: PyRea
     Ok(action)
 }
 
+#[pyfunction]
+fn analyze_trend_rust(context_window: PyReadonlyArray1<f32>, prediction_window: PyReadonlyArray1<f32>) -> PyResult<(f32, f32, f32)> {
+    // Replicating c++ one for comparison
+
+    let context_window = context_window.as_slice()?;
+    let prediction_window = prediction_window.as_slice()?;
+
+    // Calculate volatility bounds using the context window
+    let (volatility, lower_bound, upper_bound) = calculate_volatility_bounds(&context_window);
+
+    Ok((volatility, lower_bound, upper_bound))
+}
+
 fn covariance(x: &[f32], y: &[f32], bias: bool) -> (f32, f32, f32) {
+    let parallel = false;
+
     let n = x.len() as f32;
-    let x_mean = x.par_iter().sum::<f32>() / n;
-    let y_mean = y.par_iter().sum::<f32>() / n;
 
-    let (ssxm, ssxym, ssym) = x.par_iter().zip(y)
-        .fold(|| (0.0, 0.0, 0.0), |(mut ssxm, mut ssxym, mut ssym), (&xi, &yi)| {
-            let dx = xi - x_mean;
-            let dy = yi - y_mean;
-            ssxm += dx * dx;
-            ssxym += dx * dy;
-            ssym += dy * dy;
-            (ssxm, ssxym, ssym)
-        })
-        .reduce(|| (0.0, 0.0, 0.0), |(ssxm1, ssxym1, ssym1), (ssxm2, ssxym2, ssym2)| {
-            (ssxm1 + ssxm2, ssxym1 + ssxym2, ssym1 + ssym2)
-        });
+    if parallel {
+        let x_mean = x.par_iter().sum::<f32>() / n;
+        let y_mean = y.par_iter().sum::<f32>() / n;
 
-    let divisor = if bias { n } else { n - 1.0 };
+        let (ssxm, ssxym, ssym) = x.par_iter().zip(y)
+            .fold(|| (0.0, 0.0, 0.0), |(mut ssxm, mut ssxym, mut ssym), (&xi, &yi)| {
+                let dx = xi - x_mean;
+                let dy = yi - y_mean;
+                ssxm += dx * dx;
+                ssxym += dx * dy;
+                ssym += dy * dy;
+                (ssxm, ssxym, ssym)
+            })
+            .reduce(|| (0.0, 0.0, 0.0), |(ssxm1, ssxym1, ssym1), (ssxm2, ssxym2, ssym2)| {
+                (ssxm1 + ssxm2, ssxym1 + ssxym2, ssym1 + ssym2)
+            });
+    
+        let (ssxm, ssxym, ssym) = x.iter().zip(y)
+            .fold((0.0, 0.0, 0.0), |(ssxm, ssxym, ssym), (&xi, &yi)| {
+                let dx = xi - x_mean;
+                let dy = yi - y_mean;
+                (ssxm + dx * dx, ssxym + dx * dy, ssym + dy * dy)
+            });
 
-    (ssxm / divisor, ssxym / divisor, ssym / divisor)
+        let divisor = if bias { n } else { n - 1.0 };
+
+        (ssxm / divisor, ssxym / divisor, ssym / divisor)
+    } else {
+        let x_mean = x.iter().sum::<f32>() / n;
+        let y_mean = y.iter().sum::<f32>() / n;
+    
+        let (ssxm, ssxym, ssym) = x.iter().zip(y)
+            .fold((0.0, 0.0, 0.0), |(ssxm, ssxym, ssym), (&xi, &yi)| {
+                let dx = xi - x_mean;
+                let dy = yi - y_mean;
+                (ssxm + dx * dx, ssxym + dx * dy, ssym + dy * dy)
+            });
+
+        let divisor = if bias { n } else { n - 1.0 };
+
+        (ssxm / divisor, ssxym / divisor, ssym / divisor)
+    }
 }
 
 fn linregress2(x: &[f32], y: &[f32]) -> f32 {
@@ -57,7 +96,7 @@ fn moving_average(data: &[f32], window_size: usize) -> Vec<f32> {
     }
 
     let mut result = Vec::with_capacity(data.len() - window_size + 1);
-    let mut sum: f32 = data[..window_size].par_iter().sum();
+    let mut sum: f32 = data[..window_size].iter().sum();
     result.push(sum / window_size as f32);
 
     for i in window_size..data.len() {
@@ -77,8 +116,8 @@ fn calculate_volatility_bounds(historical_data: &[f32]) -> (f32, f32, f32) {
         .collect();
 
     // Calculate volatility (standard deviation of returns)
-    let mean = returns.par_iter().sum::<f32>() / returns.len() as f32;
-    let volatility = returns.par_iter()
+    let mean = returns.iter().sum::<f32>() / returns.len() as f32;
+    let volatility = returns.iter()
         .map(|&r| (r - mean).powi(2))
         .sum::<f32>() / returns.len() as f32;
     let volatility = volatility.sqrt();
@@ -96,7 +135,7 @@ fn calculate_volatility_bounds(historical_data: &[f32]) -> (f32, f32, f32) {
 fn calculate_ema(data: &[f32], period: usize) -> Vec<f32> {
     let alpha = 2.0 / (period as f32 + 1.0);
     let mut ema = Vec::with_capacity(data.len());
-    ema.push(data[..period].par_iter().sum::<f32>() / period as f32);
+    ema.push(data[..period].iter().sum::<f32>() / period as f32);
 
     for &price in data[period..].iter() {
         ema.push((price * alpha) + (ema.last().unwrap() * (1.0 - alpha)));
@@ -134,5 +173,6 @@ fn trend_analysis_with_volatility(data: &[f32], lower_bound: f32, upper_bound: f
 #[pymodule]
 fn rust_metrics_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(analyze_trend, m)?)?;
+    m.add_function(wrap_pyfunction!(analyze_trend_rust, m)?)?;
     Ok(())
 }
